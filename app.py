@@ -6,6 +6,7 @@ import json
 import PyPDF2
 import io
 from pathlib import Path
+import re
 
 # Set page configuration
 st.set_page_config(
@@ -18,63 +19,89 @@ st.set_page_config(
 GEMINI_API_KEY = "AIzaSyCviEIIdHiZ0N2SWH5VsAlirsgcVVB7VmM"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
+def clean_text(text):
+    """Clean extracted text by removing extra whitespace and normalizing line breaks."""
+    # Remove multiple spaces
+    text = re.sub(r'\s+', ' ', text)
+    # Remove multiple newlines
+    text = re.sub(r'\n\s*\n', '\n\n', text)
+    # Remove special characters but keep basic punctuation
+    text = re.sub(r'[^\w\s.,;:?!()\-\'\"%₹]', '', text)
+    return text.strip()
+
 def extract_text_from_pdf(pdf_file):
-    """Extract text from a PDF file."""
+    """Extract text from a PDF file with improved handling."""
     pdf_reader = PyPDF2.PdfReader(pdf_file)
     text = ""
     for page_num in range(len(pdf_reader.pages)):
-        text += pdf_reader.pages[page_num].extract_text()
-    return text
+        page = pdf_reader.pages[page_num]
+        text += page.extract_text() + "\n"
+    return clean_text(text)
 
 def extract_text_from_pdf_path(pdf_path):
-    """Extract text from a PDF file path."""
+    """Extract text from a PDF file path with improved handling."""
     with open(pdf_path, 'rb') as file:
         pdf_reader = PyPDF2.PdfReader(file)
         text = ""
         for page_num in range(len(pdf_reader.pages)):
-            text += pdf_reader.pages[page_num].extract_text()
-    return text
+            page = pdf_reader.pages[page_num]
+            text += page.extract_text() + "\n"
+    return clean_text(text)
 
 def query_gemini(prompt, context, api_key):
-    """Query the Gemini API with the given prompt and context."""
+    """Query the Gemini API with improved context handling."""
     url = f"{GEMINI_API_URL}?key={api_key}"
     
-    # Construct the full prompt with context
+    # Construct a more focused prompt
     full_prompt = f"""
-    Based on the following Indian Budget 2025 document content, please answer the question.
+    You are an expert on the Indian Budget 2025. Based on the following document content, please answer the question.
+    Focus on providing specific, accurate information from the documents.
     
     Document content:
     {context}
     
     Question: {prompt}
     
-    Please provide a detailed and accurate answer based only on the information in the document.
-    If the information is not available in the documents, please state that clearly.
+    Instructions:
+    1. Answer based ONLY on the information provided in the documents
+    2. If the information is not available in the documents, clearly state that
+    3. If you find partial information, mention what is available and what is not
+    4. Include specific numbers, percentages, and key details when available
+    5. Structure your response in a clear, organized manner
     """
     
     payload = {
         "contents": [{
             "parts": [{"text": full_prompt}]
-        }]
+        }],
+        "generationConfig": {
+            "temperature": 0.3,  # Lower temperature for more focused responses
+            "topP": 0.8,
+            "topK": 40,
+            "maxOutputTokens": 2048,
+        }
     }
     
     headers = {
         "Content-Type": "application/json"
     }
     
-    response = requests.post(url, headers=headers, data=json.dumps(payload))
-    
-    if response.status_code == 200:
-        response_data = response.json()
-        if 'candidates' in response_data and len(response_data['candidates']) > 0:
-            if 'content' in response_data['candidates'][0] and 'parts' in response_data['candidates'][0]['content']:
-                return response_data['candidates'][0]['content']['parts'][0]['text']
-        return "Sorry, I couldn't generate a response."
-    else:
-        return f"Error: {response.status_code} - {response.text}"
+    try:
+        response = requests.post(url, headers=headers, data=json.dumps(payload))
+        
+        if response.status_code == 200:
+            response_data = response.json()
+            if 'candidates' in response_data and len(response_data['candidates']) > 0:
+                if 'content' in response_data['candidates'][0] and 'parts' in response_data['candidates'][0]['content']:
+                    return response_data['candidates'][0]['content']['parts'][0]['text']
+            return "Sorry, I couldn't generate a response."
+        else:
+            return f"Error: {response.status_code} - {response.text}"
+    except Exception as e:
+        return f"Error processing request: {str(e)}"
 
 def load_pdfs_from_directory(directory_path):
-    """Load all PDFs from a directory."""
+    """Load all PDFs from a directory with improved error handling."""
     loaded_pdfs = {}
     pdf_files = list(Path(directory_path).glob("*.pdf"))
     
@@ -87,8 +114,11 @@ def load_pdfs_from_directory(directory_path):
             with st.spinner(f"Processing {file_name}..."):
                 try:
                     pdf_content = extract_text_from_pdf_path(pdf_path)
-                    loaded_pdfs[file_name] = pdf_content
-                    st.success(f"Successfully processed '{file_name}'")
+                    if pdf_content.strip():  # Only add if content is not empty
+                        loaded_pdfs[file_name] = pdf_content
+                        st.success(f"Successfully processed '{file_name}'")
+                    else:
+                        st.warning(f"No text content found in '{file_name}'")
                 except Exception as e:
                     st.error(f"Error processing '{file_name}': {str(e)}")
     
@@ -124,8 +154,11 @@ with st.sidebar:
             if file_name not in st.session_state.pdf_contents:
                 with st.spinner(f"Processing {file_name}..."):
                     pdf_content = extract_text_from_pdf(uploaded_file)
-                    st.session_state.pdf_contents[file_name] = pdf_content
-                st.success(f"Successfully processed '{file_name}'")
+                    if pdf_content.strip():  # Only add if content is not empty
+                        st.session_state.pdf_contents[file_name] = pdf_content
+                        st.success(f"Successfully processed '{file_name}'")
+                    else:
+                        st.warning(f"No text content found in '{file_name}'")
     
     # Option 2: Load from directory
     st.subheader("Option 2: Load from Directory")
@@ -181,10 +214,11 @@ if prompt := st.chat_input("Ask a question about the Indian Budget 2025..."):
         # Get response from Gemini using all PDFs
         with st.chat_message("assistant"):
             with st.spinner("Searching through all documents..."):
-                # Combine all PDF contents with document names
+                # Combine all PDF contents with document names and better formatting
                 combined_context = ""
                 for pdf_name, pdf_content in st.session_state.pdf_contents.items():
-                    combined_context += f"\n\n--- DOCUMENT: {pdf_name} ---\n{pdf_content[:50000]}"  # Limit content size
+                    # Add document name and content with better formatting
+                    combined_context += f"\n\n=== {pdf_name} ===\n{pdf_content}\n"
                 
                 # Get response based on all documents
                 response = query_gemini(prompt, combined_context, GEMINI_API_KEY)
